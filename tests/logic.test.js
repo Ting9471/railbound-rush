@@ -1,5 +1,156 @@
 import { describe, expect, it } from "vitest";
-import { clampLane, springStep, overlaps, playerBounds, obstacleBounds, canLandOnRoof, coinCollected, wrapChunkZ, PATTERNS } from "../src/logic.js";
+import { PerspectiveCamera, Vector3 } from "three";
+import { readFileSync } from "node:fs";
+import { clampLane, springStep, overlaps, playerBounds, obstacleBounds, canLandOnRoof, coinCollected, wrapChunkZ, PATTERNS, runnerAnimationState, jumpAnimationPhase, CHARACTERS, resolveCharacter, runCameraLayout, LANES, PLAYER_Z, cycleCharacter } from "../src/logic.js";
+
+describe("character selection", () => {
+  it("offers exactly the original, Ch09 and cat without the rejected director version", () => {
+    expect(CHARACTERS.map(character => character.id)).toEqual(["classic", "ch09", "cat"]);
+    expect(new Set(CHARACTERS.map(character => character.file)).size).toBe(3);
+  });
+  it("uses the player-facing names and slightly enlarges Tim and the cat", () => {
+    expect(CHARACTERS.map(character => character.name)).toEqual(["经典", "蒂姆", "猫猫跑者"]);
+    expect(CHARACTERS.find(character => character.id === "classic").scale).toBe(0.82);
+    for (const id of ["ch09", "cat"]) expect(CHARACTERS.find(character => character.id === id).scale).toBe(1.12);
+  });
+  it("cycles through all runners in both directions and wraps at the ends", () => {
+    expect(cycleCharacter("classic", 1)).toBe("ch09");
+    expect(cycleCharacter("ch09", 1)).toBe("cat");
+    expect(cycleCharacter("cat", 1)).toBe("classic");
+    expect(cycleCharacter("classic", -1)).toBe("cat");
+    expect(cycleCharacter("cat", -1)).toBe("ch09");
+    expect(cycleCharacter("ch09", -1)).toBe("classic");
+  });
+  it("defaults to the new cat and restores a saved choice", () => {
+    expect(resolveCharacter(null, null)).toBe("cat");
+    expect(resolveCharacter(null, "ch09")).toBe("ch09");
+    expect(resolveCharacter(null, "classic")).toBe("classic");
+  });
+  it("honors valid shared links before a saved choice", () => {
+    expect(resolveCharacter("cat", "classic")).toBe("cat");
+    expect(resolveCharacter("classic", "cat")).toBe("classic");
+  });
+  it("ignores invalid query or storage values", () => {
+    expect(resolveCharacter("director", "ch09")).toBe("ch09");
+    expect(resolveCharacter("unknown", "unknown")).toBe("cat");
+  });
+});
+
+describe("imported character animation", () => {
+  const player = { support: "ground", sliding: false, dead: false };
+  it("uses idle for menus and completed runs", () => {
+    for (const phase of ["menu", "over"]) expect(runnerAnimationState(player, phase)).toBe("Idle");
+    expect(runnerAnimationState({ ...player, dead: true }, "running")).toBe("Idle");
+  });
+  it("runs on the ground or a train roof", () => {
+    expect(runnerAnimationState(player, "running")).toBe("Run");
+    expect(runnerAnimationState({ ...player, support: { roofY: 2.78 } }, "running")).toBe("Run");
+  });
+  it("uses jump before slide when unsupported", () => {
+    expect(runnerAnimationState({ ...player, support: null, sliding: true }, "running")).toBe("Jump");
+    expect(runnerAnimationState({ ...player, sliding: true }, "running")).toBe("Slide");
+  });
+});
+
+describe("Ch09 Fast Run asset", () => {
+  it("includes the downloaded Run cycle and keeps the other gameplay clips", () => {
+    const data = readFileSync(new URL("../public/models/ch09.glb", import.meta.url));
+    expect(data.toString("ascii", 0, 4)).toBe("glTF");
+    const jsonLength = data.readUInt32LE(12);
+    const document = JSON.parse(data.toString("utf8", 20, 20 + jsonLength));
+    const binary = data.subarray(28 + jsonLength);
+    const scalarValues = index => {
+      const accessor = document.accessors[index], view = document.bufferViews[accessor.bufferView];
+      expect(accessor.componentType).toBe(5126);
+      const offset = (view.byteOffset || 0) + (accessor.byteOffset || 0);
+      return Array.from({ length: accessor.count }, (_, i) => binary.readFloatLE(offset + i * (view.byteStride || 4)));
+    };
+    const clips = new Map(document.animations.map(clip => [clip.name, clip]));
+    expect([...clips.keys()].sort()).toEqual(["Idle", "Jump", "Run", "Slide"]);
+    for (const [name, duration] of [["Idle", 2], ["Jump", 0.9], ["Slide", 0.8], ["Run", 16 / 30]]) {
+      const clip = clips.get(name);
+      const times = clip.samplers.flatMap(sampler => scalarValues(sampler.input));
+      expect(Math.max(...times) - Math.min(...times)).toBeCloseTo(duration, 5);
+    }
+    const run = clips.get("Run");
+    const root = run.channels.find(channel => channel.target.path === "translation"
+      && document.nodes[channel.target.node].name.endsWith("Hips"));
+    expect(root).toBeDefined();
+    const accessor = document.accessors[run.samplers[root.sampler].output];
+    const view = document.bufferViews[accessor.bufferView];
+    const offset = (view.byteOffset || 0) + (accessor.byteOffset || 0);
+    for (const axis of [0, 2]) {
+      const values = Array.from({ length: accessor.count }, (_, i) =>
+        binary.readFloatLE(offset + i * (view.byteStride || 12) + axis * 4));
+      expect(Math.max(...values) - Math.min(...values)).toBeLessThan(0.001);
+    }
+    expect(document.skins[0].joints).toHaveLength(65);
+    expect(document.nodes.filter(node => node.mesh !== undefined).map(node => node.name)).toEqual(["Ch09"]);
+  });
+});
+
+describe("jump animation synchronization", () => {
+  it("maps takeoff and apex onto the first half", () => {
+    expect(jumpAnimationPhase({ y: 0, vy: 11.2 })).toBe(0);
+    expect(jumpAnimationPhase({ y: 3.2, vy: 0 })).toBe(0.5);
+  });
+  it("starts a roof fall in the descending half", () => {
+    expect(jumpAnimationPhase({ y: 2.78, vy: 0 })).toBe(0.5);
+    expect(jumpAnimationPhase({ y: 1.5, vy: -7 })).toBeGreaterThan(0.5);
+  });
+  it("finishes at the landing surface, including a train roof", () => {
+    expect(jumpAnimationPhase({ y: 2.78, vy: -4 }, 2.78)).toBe(1);
+    expect(jumpAnimationPhase({ y: 0, vy: -11.2 })).toBe(1);
+    expect(jumpAnimationPhase({ y: 0, vy: 0 })).toBe(1);
+  });
+  it("clamps the rising phase when velocities exceed launch speed", () => {
+    expect(jumpAnimationPhase({ y: 0, vy: 20 })).toBe(0);
+  });
+});
+
+describe("runner camera framing", () => {
+  it("anchors the runner near the bottom with the slide head in the bottom tenth", () => {
+    for (const aspect of [1440 / 900, 390 / 844, 320 / 740, 844 / 390]) {
+      for (const fov of [58, 61.6]) {
+        const layout = runCameraLayout(aspect, fov);
+        const camera = new PerspectiveCamera(fov, aspect, 0.1, 220);
+        camera.position.set(0, layout.height, layout.z);
+        camera.lookAt(0, layout.targetY, layout.targetZ);
+        camera.updateMatrixWorld();
+        const feet = new Vector3(0, 0, PLAYER_Z).project(camera);
+        expect((1 - feet.y) / 2).toBeCloseTo(0.98, 5);
+        const head = new Vector3(0, 0.82, PLAYER_Z).project(camera);
+        expect((1 - head.y) / 2).toBeGreaterThan(0.9);
+        expect((1 - head.y) / 2).toBeLessThan(0.98);
+      }
+    }
+  });
+  for (const [width, height] of [[1440, 900], [390, 844], [320, 740], [844, 390]]) {
+    it(`keeps all lanes and low poses visible at ${width}x${height}`, () => {
+      for (const fov of [58, 61.6]) {
+        const aspect = width / height, layout = runCameraLayout(aspect, fov);
+        for (const cameraX of [-0.816, 0, 0.816]) {
+          const camera = new PerspectiveCamera(fov, aspect, 0.1, 220);
+          camera.position.set(cameraX, layout.height, layout.z);
+          camera.lookAt(cameraX * 0.25, layout.targetY, layout.targetZ);
+          camera.updateMatrixWorld();
+          for (const lane of LANES) for (const offset of [-0.7, 0.7]) {
+            for (const y of [0, 0.82, 2.05, 8.1]) {
+              const point = new Vector3(lane + offset, y, PLAYER_Z).project(camera);
+              expect(Math.abs(point.x)).toBeLessThan(1);
+              expect(Math.abs(point.y)).toBeLessThan(1);
+              if (y === 0) {
+                const groundY = (1 - point.y) / 2;
+                expect(groundY).toBeGreaterThan(0.96);
+                expect(groundY).toBeLessThan(0.995);
+              }
+            }
+          }
+        }
+      }
+    });
+  }
+});
 
 describe("runner movement", () => {
   it("keeps lane indices inside three tracks", () => {

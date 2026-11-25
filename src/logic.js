@@ -2,6 +2,44 @@ export const LANES = [-3.4, 0, 3.4];
 export const PLAYER_Z = 4;
 export const GROUND_Y = 0;
 
+export function runCameraLayout(aspect, fov = 58) {
+  // Fit every lane, then anchor the runner's feet at 98% of the screen height.
+  const halfFov = Math.tan(fov * Math.PI / 360);
+  const distance = Math.max(10, 5.2 / (Math.max(0.1, aspect) * halfFov));
+  const height = 0.56 * distance;
+  const pitch = Math.atan2(height - GROUND_Y, distance) - Math.atan(0.96 * halfFov);
+  return { height, z: PLAYER_Z + distance, targetY: height - 2 * distance * Math.tan(pitch), targetZ: PLAYER_Z - distance };
+}
+
+export const CHARACTERS = [
+  { id: "classic", name: "经典", file: "runner.glb", animation: "nodes", scale: 0.82 },
+  { id: "ch09", name: "蒂姆", file: "ch09.glb", animation: "clips", scale: 1.12 },
+  { id: "cat", name: "猫猫跑者", file: "cat_guy_thing.glb", animation: "clips", scale: 1.12 }
+];
+
+export function resolveCharacter(query, saved) {
+  const known = id => CHARACTERS.some(character => character.id === id);
+  return known(query) ? query : known(saved) ? saved : "cat";
+}
+
+export function cycleCharacter(id, direction) {
+  const index = Math.max(0, CHARACTERS.findIndex(character => character.id === id));
+  return CHARACTERS[((index + direction) % CHARACTERS.length + CHARACTERS.length) % CHARACTERS.length].id;
+}
+
+export function runnerAnimationState(player, phase) {
+  if (phase !== "running" || player.dead) return "Idle";
+  if (!player.support) return "Jump";
+  return player.sliding ? "Slide" : "Run";
+}
+
+export function jumpAnimationPhase(player, landingY = GROUND_Y) {
+  if (player.vy > 0) return Math.max(0, Math.min(0.5, 0.5 * (1 - player.vy / 11.2)));
+  const height = Math.max(0, player.y - landingY);
+  const impactSpeed = Math.sqrt(player.vy * player.vy + 2 * 19.5 * height);
+  return impactSpeed > 0 ? 0.5 + 0.5 * Math.min(1, -player.vy / impactSpeed) : 1;
+}
+
 export function clampLane(index) {
   return Math.max(0, Math.min(2, index));
 }
