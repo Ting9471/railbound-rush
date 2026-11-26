@@ -1,7 +1,73 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PerspectiveCamera, Vector3 } from "three";
 import { readFileSync } from "node:fs";
-import { clampLane, springStep, overlaps, playerBounds, obstacleBounds, canLandOnRoof, coinCollected, wrapChunkZ, PATTERNS, runnerAnimationState, jumpAnimationPhase, CHARACTERS, resolveCharacter, runCameraLayout, LANES, PLAYER_Z, cycleCharacter } from "../src/logic.js";
+import { clampLane, springStep, overlaps, playerBounds, obstacleBounds, canLandOnRoof, coinCollected, wrapChunkZ, PATTERNS, runnerAnimationState, jumpAnimationPhase, CHARACTERS, resolveCharacter, runCameraLayout, LANES, PLAYER_Z, cycleCharacter, loadModelData, withTimeout } from "../src/logic.js";
+
+describe("model download reliability", () => {
+  afterEach(() => { vi.unstubAllGlobals();vi.useRealTimers(); });
+
+  it("assembles streamed model bytes and reports real download progress", async () => {
+    const onProgress = vi.fn();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2]));
+        controller.enqueue(new Uint8Array([3, 4, 5]));
+        controller.close();
+      }
+    }))));
+    expect([...new Uint8Array(await loadModelData("https://example.com/models/cat.glb", { onProgress }))]).toEqual([1, 2, 3, 4, 5]);
+    expect(onProgress.mock.calls.map(([loaded]) => loaded)).toEqual([2, 5]);
+  });
+
+  it("rejects missing models instead of attempting to parse an HTML error", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("missing", { status: 404 })));
+    await expect(loadModelData("https://example.com/missing.glb")).rejects.toThrow("HTTP 404");
+  });
+
+  it("aborts stalled downloads at the deadline", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn((url, { signal }) => new Promise((resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    })));
+    const result = expect(loadModelData("https://example.com/stalled.glb", { timeoutMs: 1000 })).rejects.toThrow("模型下载超时");
+    await vi.advanceTimersByTimeAsync(1000);
+    await result;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("cancels the previous runner download when switching", async () => {
+    const controller = new AbortController();
+    let downloadSignal;
+    vi.stubGlobal("fetch", vi.fn((url, { signal }) => {
+      downloadSignal = signal;
+      return new Promise((resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    }));
+    const result = expect(loadModelData("https://example.com/cat.glb", { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+    controller.abort();
+    await result;
+    expect(downloadSignal.aborted).toBe(true);
+  });
+
+  it("preserves network errors so callers can offer a retry", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
+    await expect(loadModelData("https://example.com/cat.glb")).rejects.toThrow("Failed to fetch");
+  });
+
+  it("bounds model parsing and clears the deadline after success", async () => {
+    vi.useFakeTimers();
+    await expect(withTimeout(Promise.resolve("model"), 1000, "解析超时")).resolves.toBe("model");
+    expect(vi.getTimerCount()).toBe(0);
+    const result = expect(withTimeout(new Promise(() => {}), 1000, "解析超时")).rejects.toThrow("解析超时");
+    await vi.advanceTimersByTimeAsync(1000);
+    await result;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not depend on external font downloads to load the game", () => {
+    const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+    expect(css).not.toMatch(/@import\s+url\(['"]https?:/);
+  });
+});
 
 describe("character selection", () => {
   it("offers exactly the original, Ch09 and cat without the rejected director version", () => {

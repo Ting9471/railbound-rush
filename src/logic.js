@@ -17,6 +17,48 @@ export const CHARACTERS = [
   { id: "cat", name: "猫猫跑者", file: "cat_guy_thing.glb", animation: "clips", scale: 1.12 }
 ];
 
+export async function loadModelData(url, { signal, onProgress, timeoutMs = 45000 } = {}) {
+  const controller = new AbortController();
+  const abort = () => controller.abort(signal.reason);
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(() => controller.abort(new Error("模型下载超时，请重试或切换其他跑者")), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) throw new Error(`模型下载失败（HTTP ${response.status}）`);
+    if (!response.body) return await response.arrayBuffer();
+    const reader = response.body.getReader(), chunks = [];
+    let loaded = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);loaded += value.byteLength;
+        onProgress?.(loaded);
+      }
+    } finally { reader.releaseLock(); }
+    const bytes = new Uint8Array(loaded);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset);offset += chunk.byteLength; }
+    return bytes.buffer;
+  } catch (error) {
+    if (controller.signal.aborted) throw controller.signal.reason;
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+export async function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
 export function resolveCharacter(query, saved) {
   const known = id => CHARACTERS.some(character => character.id === id);
   return known(query) ? query : known(saved) ? saved : "cat";

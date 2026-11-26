@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import "./styles.css";
-import { LANES, PLAYER_Z, GROUND_Y, PATTERNS, clampLane, springStep, overlaps, playerBounds, obstacleBounds, trainBodyBounds, canLandOnRoof, coinCollected, wrapChunkZ, mulberry32, runnerAnimationState, jumpAnimationPhase, CHARACTERS, resolveCharacter, runCameraLayout, cycleCharacter } from "./logic.js";
+import { LANES, PLAYER_Z, GROUND_Y, PATTERNS, clampLane, springStep, overlaps, playerBounds, obstacleBounds, trainBodyBounds, canLandOnRoof, coinCollected, wrapChunkZ, mulberry32, runnerAnimationState, jumpAnimationPhase, CHARACTERS, resolveCharacter, runCameraLayout, cycleCharacter, loadModelData, withTimeout } from "./logic.js";
 
 const $ = selector => document.querySelector(selector);
 const ui = {
@@ -85,7 +85,7 @@ class Game {
     this.player={lane:1,x:0,vx:0,y:0,vy:0,sliding:false,slideTime:0,support:null,dead:false}; this.slideHeld=false;
     let savedCharacter=null;try{savedCharacter=localStorage.getItem("railboundCharacter");}catch{}
     this.characterId=resolveCharacter(new URLSearchParams(location.search).get("model"),savedCharacter);
-    this.characterModels=new Map();this.characterLoads=new Map();this.characterRequest=0;this.characterLoading=false;this.previewAngle="front";
+    this.characterModels=new Map();this.characterRequest=0;this.characterLoading=false;this.previewAngle="front";
     this.initScene(); this.bind(); this.syncCharacterUI();this.updateMenuPreview();requestAnimationFrame(t=>this.loop(t));
   }
   initScene(){
@@ -98,10 +98,14 @@ class Game {
     this.world=new THREE.Group(); this.scene.add(this.world); this.makeEnvironment(); this.runner=createRunner(); this.runner.position.set(0,0,PLAYER_Z); this.scene.add(this.runner); this.loadRunnerModel(); this.loadAncientEnvironment();
   }
   loadRunnerModel(){this.selectCharacter(this.characterId);}
-  getCharacterModel(character){
-    if(this.characterModels.has(character.id))return Promise.resolve(this.characterModels.get(character.id));
-    if(this.characterLoads.has(character.id))return this.characterLoads.get(character.id);
-    const promise=new GLTFLoader().loadAsync(`${import.meta.env.BASE_URL}models/${character.file}`).then(gltf=>{
+  async getCharacterModel(character,signal,onProgress){
+    if(this.characterModels.has(character.id))return this.characterModels.get(character.id);
+    const url=new URL(`${import.meta.env.BASE_URL}models/${character.file}`,document.baseURI);
+    const data=await loadModelData(url.href,{signal,onProgress});
+    signal.throwIfAborted();
+    $("#characterStatus").textContent=`${character.name}下载完成，正在解析三维模型…`;
+    const gltf=await withTimeout(new GLTFLoader().parseAsync(data,new URL(".",url).href),15000,"模型解析超时，请重试或切换其他跑者");
+    signal.throwIfAborted();
       const model=new THREE.Group(),content=gltf.scene;model.name=`${character.id}_Gameplay`;
       content.rotation.y=Math.PI;content.scale.setScalar(character.scale);model.add(content);model.userData.content=content;model.userData.visualScale=character.scale;
       const nodes={};let hasSkin=false;
@@ -125,16 +129,21 @@ class Game {
       }
       model.userData.rig=rig;model.userData.characterId=character.id;
       this.characterModels.set(character.id,model);return model;
-    }).finally(()=>this.characterLoads.delete(character.id));
-    this.characterLoads.set(character.id,promise);return promise;
   }
   async selectCharacter(id){
     const character=CHARACTERS.find(item=>item.id===id);if(!character||!["welcome","menu"].includes(this.phase))return;
+    this.characterController?.abort();
+    this.characterController=new AbortController();
     $("#retryCharacter").hidden=true;
     const request=++this.characterRequest;this.characterId=id;this.characterLoading=true;
     this.syncCharacterUI(`正在加载${character.name}…`);
     try{
-      const model=await this.getCharacterModel(character);
+      let lastProgress=0;
+      const model=await this.getCharacterModel(character,this.characterController.signal,loaded=>{
+        if(request!==this.characterRequest||performance.now()-lastProgress<200)return;
+        lastProgress=performance.now();
+        $("#characterStatus").textContent=`正在下载${character.name} · ${(loaded/1024/1024).toFixed(1)} MB`;
+      });
       if(request!==this.characterRequest)return;
       const previous=this.runner,shadowDisc=previous.userData.rig.shadow;
       if(model!==previous){
@@ -159,7 +168,7 @@ class Game {
       console.warn(`Character ${id} failed to load`,error);this.characterLoading=false;
       this.characterId=this.runner.userData.characterId||id;
       this.failedCharacterId=id;$("#retryCharacter").hidden=false;
-      this.syncCharacterUI(`${character.name}加载失败，请重试或切换其他跑者`);
+      this.syncCharacterUI(`${character.name}加载失败：${error.message||"网络异常"}。可重试、切换或使用当前跑者开始。`);
     }
   }
   syncCharacterUI(message){
